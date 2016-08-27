@@ -8,7 +8,6 @@ import (
 	"bufio"
 	"bytes"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tidwall/btree"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/rtree"
 )
 
@@ -52,18 +52,12 @@ var (
 	ErrShrinkInProcess = errors.New("shrink is in-process")
 )
 
-// Iterator allows callers of Ascend* or Descend* to iterate in-order
-// over portions of an index. When this function returns false, iteration
-// will stop and the associated Ascend* or Descend* function will immediately
-// return.
-type Iterator func(key, val string) bool
-
 // DB represents a collection of key-value pairs that persist on disk.
 // Transactions are used for all forms of data access to the DB.
 type DB struct {
 	mu        sync.RWMutex      // the gatekeeper for all fields
 	file      *os.File          // the underlying file
-	bufw      *bufio.Writer     // only write to this
+	buf       *bytes.Buffer     // a buffer to write to
 	keys      *btree.BTree      // a tree of all item ordered by key
 	exps      *btree.BTree      // a tree of items ordered by expiration
 	idxs      map[string]*index // the index trees.
@@ -89,7 +83,7 @@ const (
 	// This is the recommended setting.
 	EverySecond = 1
 	// Always is used to sync data after every write to disk.
-	// Very very slow. Very safe.
+	// Slow. Very safe.
 	Always = 2
 )
 
@@ -112,6 +106,9 @@ type Config struct {
 	// AutoShrinkMinSize defines the minimum size of the aof file before
 	// an automatic shrink can occur.
 	AutoShrinkMinSize int
+
+	// AutoShrinkDisabled turns off automatic background shrinking
+	AutoShrinkDisabled bool
 }
 
 // exctx is a simple b-tree context for ordering by expiration.
@@ -119,13 +116,17 @@ type exctx struct {
 	db *DB
 }
 
+// Default number of btree degrees
+const btreeDegrees = 64
+
 // Open opens a database at the provided path.
 // If the file does not exist then it will be created automatically.
 func Open(path string) (*DB, error) {
 	db := &DB{}
-	db.keys = btree.New(16, nil)
-	db.exps = btree.New(16, &exctx{db})
+	db.keys = btree.New(btreeDegrees, nil)
+	db.exps = btree.New(btreeDegrees, &exctx{db})
 	db.idxs = make(map[string]*index)
+	db.buf = &bytes.Buffer{}
 	db.config = Config{
 		SyncPolicy:           EverySecond,
 		AutoShrinkPercentage: 100,
@@ -143,7 +144,6 @@ func Open(path string) (*DB, error) {
 			_ = db.file.Close()
 			return nil, err
 		}
-		db.bufw = bufio.NewWriter(db.file)
 	}
 	// start the background manager.
 	go db.backgroundManager()
@@ -160,13 +160,14 @@ func (db *DB) Close() error {
 	}
 	db.closed = true
 	if db.persist {
+		db.file.Sync() // do a sync but ignore the error
 		if err := db.file.Close(); err != nil {
 			return err
 		}
 	}
 	// Let's release all references to nil. This will help both with debugging
 	// late usage panics and it provides a hint to the garbage collector
-	db.keys, db.exps, db.idxs, db.file, db.bufw = nil, nil, nil, nil, nil
+	db.keys, db.exps, db.idxs, db.file = nil, nil, nil, nil
 	return nil
 }
 
@@ -196,7 +197,7 @@ type index struct {
 // There are some default less function that can be used such as
 // IndexString, IndexBinary, etc.
 func (db *DB) CreateIndex(name, pattern string,
-	less func(a, b string) bool) error {
+	less ...func(a, b string) bool) error {
 	return db.createIndex(name, pattern, less, nil)
 }
 
@@ -223,7 +224,7 @@ func (db *DB) CreateSpatialIndex(name, pattern string,
 func (db *DB) createIndex(
 	name string,
 	pattern string,
-	less func(a, b string) bool,
+	lessers []func(a, b string) bool,
 	rect func(item string) (min, max []float64),
 ) error {
 	db.mu.Lock()
@@ -237,6 +238,25 @@ func (db *DB) createIndex(
 	if _, ok := db.idxs[name]; ok {
 		return ErrIndexExists
 	}
+	var less func(a, b string) bool
+	switch len(lessers) {
+	default:
+		less = func(a, b string) bool {
+			for i := 0; i < len(lessers)-1; i++ {
+				if lessers[i](a, b) {
+					return true
+				}
+				if lessers[i](b, a) {
+					return false
+				}
+			}
+			return lessers[len(lessers)-1](a, b)
+		}
+	case 0:
+		less = func(a, b string) bool { return false }
+	case 1:
+		less = lessers[0]
+	}
 	idx := &index{
 		name:    name,
 		pattern: pattern,
@@ -245,11 +265,12 @@ func (db *DB) createIndex(
 		db:      db,
 	}
 	if less != nil {
-		idx.btr = btree.New(16, idx)
+		idx.btr = btree.New(btreeDegrees, idx)
 	}
 	if rect != nil {
 		idx.rtr = rtree.New(idx)
 	}
+
 	db.keys.Ascend(func(item btree.Item) bool {
 		dbi := item.(*dbItem)
 		if !wildcardMatch(dbi.key, idx.pattern) {
@@ -443,15 +464,15 @@ func (db *DB) backgroundManager() {
 		// Open a standard view. This will take a full lock of the
 		// database thus allowing for access to anything we need.
 		err := db.Update(func(tx *Tx) error {
-			if db.persist {
+			if db.persist && !db.config.AutoShrinkDisabled {
 				pos, err := db.file.Seek(0, 1)
 				if err != nil {
 					return err
 				}
 				aofsz := int(pos)
 				if aofsz > db.config.AutoShrinkMinSize {
-					perc := float64(db.config.AutoShrinkPercentage) / 100.0
-					shrink = aofsz > db.lastaofsz+int(float64(db.lastaofsz)*perc)
+					prc := float64(db.config.AutoShrinkPercentage) / 100.0
+					shrink = aofsz > db.lastaofsz+int(float64(db.lastaofsz)*prc)
 				}
 			}
 			// produce a list of expired items that need removing
@@ -528,6 +549,7 @@ func (db *DB) Shrink() error {
 		return err
 	}
 	db.mu.Unlock()
+	time.Sleep(time.Second / 4) // wait just a bit before starting
 	f, err := os.Create(tmpname)
 	if err != nil {
 		return err
@@ -539,7 +561,7 @@ func (db *DB) Shrink() error {
 
 	// we are going to read items in as chunks as to not hold up the database
 	// for too long.
-	wr := bufio.NewWriter(f)
+	buf := &bytes.Buffer{}
 	pivot := ""
 	done := false
 	for !done {
@@ -559,14 +581,15 @@ func (db *DB) Shrink() error {
 						done = false
 						return false
 					}
-					dbi.writeSetTo(wr)
+					dbi.writeSetTo(buf)
 					n++
 					return true
 				},
 			)
-			if err := wr.Flush(); err != nil {
+			if _, err := f.Write(buf.Bytes()); err != nil {
 				return err
 			}
+			buf.Reset()
 			return nil
 		}()
 		if err != nil {
@@ -576,11 +599,14 @@ func (db *DB) Shrink() error {
 	// We reached this far so all of the items have been written to a new tmp
 	// There's some more work to do by appending the new line from the aof
 	// to the tmp file and finally swap the files out.
-	err = func() error {
+	return func() error {
 		// We're wrapping this in a function to get the benefit of a defered
 		// lock/unlock.
 		db.mu.Lock()
 		defer db.mu.Unlock()
+		if db.closed {
+			return ErrDatabaseClosed
+		}
 		// We are going to open a new version of the aof file so that we do
 		// not change the seek position of the previous. This may cause a
 		// problem in the future if we choose to use syscall file locking.
@@ -607,7 +633,7 @@ func (db *DB) Shrink() error {
 		if err := db.file.Close(); err != nil {
 			return err
 		}
-		// Anything failures below here is really bad. So just panic.
+		// Any failures below here is really bad. So just panic.
 		if err := os.Rename(tmpname, fname); err != nil {
 			panic(err)
 		}
@@ -619,80 +645,12 @@ func (db *DB) Shrink() error {
 		if err != nil {
 			return err
 		}
-		// reset the bufio writer
-		db.bufw = bufio.NewWriter(db.file)
 		db.lastaofsz = int(pos)
 		return nil
 	}()
-	return err
-}
-func loadReadLine(r *bufio.Reader) (string, error) {
-	line, err := r.ReadBytes('\n')
-	if err != nil {
-		return "", err
-	}
-	if len(line) < 2 || line[len(line)-2] != '\r' {
-		return "", ErrInvalid
-	}
-	return string(line[:len(line)-2]), nil
-}
-func loadReadLineNum(r *bufio.Reader) (int, error) {
-	line, err := loadReadLine(r)
-	if err != nil {
-		return 0, err
-	}
-	n, err := strconv.ParseUint(line, 10, 64)
-	if err != nil {
-		return 0, err
-	}
-	return int(n), nil
 }
 
 var errValidEOF = errors.New("valid eof")
-
-func loadReadCommand(r *bufio.Reader) ([]string, error) {
-	c, err := r.ReadByte()
-	if err != nil {
-		if err == io.EOF {
-			return nil, errValidEOF
-		}
-		return nil, err
-	}
-	if c != '*' {
-		return nil, ErrInvalid
-	}
-	n, err := loadReadLineNum(r)
-	if err != nil {
-		return nil, err
-	}
-	parts := make([]string, n)
-	for i := 0; i < len(parts); i++ {
-		c, err := r.ReadByte()
-		if err != nil {
-			return nil, err
-		}
-		if c != '$' {
-			return nil, ErrInvalid
-		}
-		n, err := loadReadLineNum(r)
-		if err != nil {
-			return nil, err
-		}
-		data := make([]byte, n)
-		if _, err = io.ReadFull(r, data); err != nil {
-			return nil, err
-		}
-		eol := make([]byte, 2)
-		if _, err = io.ReadFull(r, eol); err != nil {
-			return nil, err
-		}
-		if eol[0] != '\r' || eol[1] != '\n' {
-			return nil, ErrInvalid
-		}
-		parts[i] = string(data)
-	}
-	return parts, nil
-}
 
 // load reads entries from the append only database file and fills the database.
 // The file format uses the Redis append only file format, which is and a series
@@ -700,30 +658,110 @@ func loadReadCommand(r *bufio.Reader) ([]string, error) {
 // http://redis.io/topics/protocol. The only supported RESP commands are DEL and
 // SET.
 func (db *DB) load() error {
+	fi, err := db.file.Stat()
+	if err != nil {
+		return err
+	}
+	modTime := fi.ModTime()
+	data := make([]byte, 4096)
+	parts := make([]string, 0, 8)
 	r := bufio.NewReader(db.file)
 	for {
-		var item = &dbItem{}
-		parts, err := loadReadCommand(r)
+		// read a single command.
+		// first we should read the number of parts that the of the command
+		line, err := r.ReadBytes('\n')
 		if err != nil {
-			if err == errValidEOF {
-				break
+			if len(line) > 0 {
+				// got an eof but also data. this should be an unexpected eof.
+				return io.ErrUnexpectedEOF
 			}
 			if err == io.EOF {
-				return io.ErrUnexpectedEOF
+				break
 			}
 			return err
 		}
+		if line[0] != '*' {
+			return ErrInvalid
+		}
+		// convert the string number to and int
+		var n int
+		if len(line) == 4 && line[len(line)-2] == '\r' {
+			if line[1] < '0' || line[1] > '9' {
+				return ErrInvalid
+			}
+			n = int(line[1] - '0')
+		} else {
+			if len(line) < 5 || line[len(line)-2] != '\r' {
+				return ErrInvalid
+			}
+			for i := 1; i < len(line)-2; i++ {
+				if line[i] < '0' || line[i] > '9' {
+					return ErrInvalid
+				}
+				n = n*10 + int(line[i]-'0')
+			}
+		}
+		// read each part of the command.
+		parts = parts[:0]
+		for i := 0; i < n; i++ {
+			// read the number of bytes of the part.
+			line, err := r.ReadBytes('\n')
+			if err != nil {
+				return err
+			}
+			if line[0] != '$' {
+				return ErrInvalid
+			}
+			// convert the string number to and int
+			var n int
+			if len(line) == 4 && line[len(line)-2] == '\r' {
+				if line[1] < '0' || line[1] > '9' {
+					return ErrInvalid
+				}
+				n = int(line[1] - '0')
+			} else {
+				if len(line) < 5 || line[len(line)-2] != '\r' {
+					return ErrInvalid
+				}
+				for i := 1; i < len(line)-2; i++ {
+					if line[i] < '0' || line[i] > '9' {
+						return ErrInvalid
+					}
+					n = n*10 + int(line[i]-'0')
+				}
+			}
+			// resize the read buffer
+			if len(data) < n+2 {
+				dataln := len(data)
+				for dataln < n+2 {
+					dataln *= 2
+				}
+				data = make([]byte, dataln)
+			}
+			if _, err = io.ReadFull(r, data[:n+2]); err != nil {
+				return err
+			}
+			if data[n] != '\r' || data[n+1] != '\n' {
+				return ErrInvalid
+			}
+			// copy string
+			parts = append(parts, string(data[:n]))
+		}
+		// finished reading the command
+
 		if len(parts) == 0 {
 			continue
 		}
-		switch strings.ToLower(parts[0]) {
-		default:
+		if len(parts[0]) != 3 {
 			return ErrInvalid
-		case "set":
+		}
+		if (parts[0][0] == 's' || parts[0][1] == 'S') &&
+			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
+			(parts[0][2] == 't' || parts[0][2] == 'T') {
+			// SET
 			if len(parts) < 3 || len(parts) == 4 || len(parts) > 5 {
 				return ErrInvalid
 			}
-			item.key, item.val = parts[1], parts[2]
 			if len(parts) == 5 {
 				if strings.ToLower(parts[3]) != "ex" {
 					return ErrInvalid
@@ -732,19 +770,31 @@ func (db *DB) load() error {
 				if err != nil {
 					return err
 				}
-				dur := time.Duration(ex) * time.Second
-				item.opts = &dbItemOpts{
-					ex:   true,
-					exat: time.Now().Add(dur),
+				now := time.Now()
+				dur := (time.Duration(ex) * time.Second) - now.Sub(modTime)
+				if dur > 0 {
+					db.insertIntoDatabase(&dbItem{
+						key: parts[1],
+						val: parts[2],
+						opts: &dbItemOpts{
+							ex:   true,
+							exat: now.Add(dur),
+						},
+					})
 				}
+			} else {
+				db.insertIntoDatabase(&dbItem{key: parts[1], val: parts[2]})
 			}
-			db.insertIntoDatabase(item)
-		case "del":
+		} else if (parts[0][0] == 'd' || parts[0][1] == 'D') &&
+			(parts[0][1] == 'e' || parts[0][1] == 'E') &&
+			(parts[0][2] == 'l' || parts[0][2] == 'L') {
+			// DEL
 			if len(parts) != 2 {
 				return ErrInvalid
 			}
-			item.key = parts[1]
-			db.deleteFromDatabase(item)
+			db.deleteFromDatabase(&dbItem{key: parts[1]})
+		} else {
+			return ErrInvalid
 		}
 	}
 	pos, err := db.file.Seek(0, 2)
@@ -902,17 +952,18 @@ func (tx *Tx) commit() error {
 	var err error
 	if tx.db.persist && len(tx.commits) > 0 {
 		// Each committed record is written to disk
+		tx.db.buf.Reset()
 		for key, item := range tx.commits {
 			if item == nil {
-				(&dbItem{key: key}).writeDeleteTo(tx.db.bufw)
+				(&dbItem{key: key}).writeDeleteTo(tx.db.buf)
 			} else {
-				item.writeSetTo(tx.db.bufw)
+				item.writeSetTo(tx.db.buf)
 			}
 		}
 		// Flushing the buffer only once per transaction.
 		// If this operation fails then the write did failed and we must
 		// rollback.
-		if err = tx.db.bufw.Flush(); err != nil {
+		if _, err = tx.db.file.Write(tx.db.buf.Bytes()); err != nil {
 			tx.rollbackInner()
 		}
 		if tx.db.config.SyncPolicy == Always {
@@ -961,31 +1012,39 @@ type dbItem struct {
 	opts     *dbItemOpts // optional meta information
 }
 
+// writeHead writes the resp header part
+func writeHead(wr *bytes.Buffer, c byte, n int) {
+	_ = wr.WriteByte(c)
+	_, _ = wr.WriteString(strconv.FormatInt(int64(n), 10))
+	_, _ = wr.WriteString("\r\n")
+}
+
+// writeMultiBulk writes a resp array
+func writeMultiBulk(wr *bytes.Buffer, bulks ...string) {
+	writeHead(wr, '*', len(bulks))
+	for _, bulk := range bulks {
+		writeHead(wr, '$', len(bulk))
+		_, _ = wr.WriteString(bulk)
+		_, _ = wr.WriteString("\r\n")
+	}
+}
+
 // writeSetTo writes an item as a single SET record to the a bufio Writer.
-func (dbi *dbItem) writeSetTo(wr *bufio.Writer) {
+func (dbi *dbItem) writeSetTo(wr *bytes.Buffer) {
 	if dbi.opts != nil && dbi.opts.ex {
 		ex := strconv.FormatUint(
 			uint64(dbi.opts.exat.Sub(time.Now())/time.Second),
 			10,
 		)
-		fmt.Fprintf(wr,
-			"*5\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n"+
-				"$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-			len("set"), "set", len(dbi.key), dbi.key,
-			len(dbi.val), dbi.val, len("ex"), "ex", len(ex), ex,
-		)
+		writeMultiBulk(wr, "set", dbi.key, dbi.val, "ex", ex)
 	} else {
-		fmt.Fprintf(wr, "*3\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-			len("set"), "set", len(dbi.key), dbi.key, len(dbi.val), dbi.val,
-		)
+		writeMultiBulk(wr, "set", dbi.key, dbi.val)
 	}
 }
 
 // writeSetTo writes an item as a single DEL record to the a bufio Writer.
-func (dbi *dbItem) writeDeleteTo(wr *bufio.Writer) {
-	fmt.Fprintf(wr,
-		"*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len("del"), "del", len(dbi.key), dbi.key)
+func (dbi *dbItem) writeDeleteTo(wr *bytes.Buffer) {
+	writeMultiBulk(wr, "del", dbi.key)
 }
 
 // expired evaluates id the item has expired. This will always return false when
@@ -1097,8 +1156,8 @@ func (tx *Tx) Set(key, value string, opts *SetOptions) (previousValue string,
 		if _, ok := tx.rollbacks[key]; !ok {
 			tx.rollbacks[key] = prev
 		}
-		if !item.expired() {
-			previousValue, replaced = item.val, true
+		if !prev.expired() {
+			previousValue, replaced = prev.val, true
 		}
 	}
 	// For commits we simply assign the item to the map. We use this map to
@@ -1116,11 +1175,8 @@ func (tx *Tx) Get(key string) (val string, err error) {
 		return "", ErrTxClosed
 	}
 	item := tx.db.get(key)
-	if item == nil {
-		return "", ErrNotFound
-	}
-	if item.expired() {
-		// The item exists in the tree, but has expired. Let's assume that
+	if item == nil || item.expired() {
+		// The item does not exists or has expired. Let's assume that
 		// the caller is only interested in items that have not expired.
 		return "", ErrNotFound
 	}
@@ -1187,9 +1243,8 @@ func (tx *Tx) TTL(key string) (time.Duration, error) {
 // The start and stop params are the greaterThan, lessThan limits. For
 // descending order, these will be lessThan, greaterThan.
 // An error will be returned if the tx is closed or the index is not found.
-func (tx *Tx) scan(
-	desc, gt, lt bool, index, start, stop string, iterator Iterator,
-) error {
+func (tx *Tx) scan(desc, gt, lt bool, index, start, stop string,
+	iterator func(key, value string) bool) error {
 	if tx.db == nil {
 		return ErrTxClosed
 	}
@@ -1216,8 +1271,13 @@ func (tx *Tx) scan(
 	// create some limit items
 	var itemA, itemB *dbItem
 	if gt || lt {
-		itemA = &dbItem{key: start}
-		itemB = &dbItem{key: stop}
+		if index == "" {
+			itemA = &dbItem{key: start}
+			itemB = &dbItem{key: stop}
+		} else {
+			itemA = &dbItem{val: start}
+			itemB = &dbItem{val: stop}
+		}
 	}
 	// execute the scan on the underlying tree.
 	if desc {
@@ -1254,7 +1314,8 @@ func (tx *Tx) scan(
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) Ascend(index string, iterator Iterator) error {
+func (tx *Tx) Ascend(index string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(false, false, false, index, "", "", iterator)
 }
 
@@ -1264,9 +1325,8 @@ func (tx *Tx) Ascend(index string, iterator Iterator) error {
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) AscendGreaterOrEqual(
-	index, pivot string, iterator Iterator,
-) error {
+func (tx *Tx) AscendGreaterOrEqual(index, pivot string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(false, true, false, index, pivot, "", iterator)
 }
 
@@ -1276,7 +1336,8 @@ func (tx *Tx) AscendGreaterOrEqual(
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) AscendLessThan(index, pivot string, iterator Iterator) error {
+func (tx *Tx) AscendLessThan(index, pivot string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(false, false, true, index, pivot, "", iterator)
 }
 
@@ -1287,7 +1348,7 @@ func (tx *Tx) AscendLessThan(index, pivot string, iterator Iterator) error {
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
 func (tx *Tx) AscendRange(index, greaterOrEqual, lessThan string,
-	iterator Iterator) error {
+	iterator func(key, value string) bool) error {
 	return tx.scan(
 		false, true, true, index, greaterOrEqual, lessThan, iterator,
 	)
@@ -1299,7 +1360,8 @@ func (tx *Tx) AscendRange(index, greaterOrEqual, lessThan string,
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) Descend(index string, iterator Iterator) error {
+func (tx *Tx) Descend(index string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(true, false, false, index, "", "", iterator)
 }
 
@@ -1309,7 +1371,8 @@ func (tx *Tx) Descend(index string, iterator Iterator) error {
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) DescendGreaterThan(index, pivot string, iterator Iterator) error {
+func (tx *Tx) DescendGreaterThan(index, pivot string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(true, true, false, index, pivot, "", iterator)
 }
 
@@ -1319,7 +1382,8 @@ func (tx *Tx) DescendGreaterThan(index, pivot string, iterator Iterator) error {
 // as specified by the less() function of the defined index.
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
-func (tx *Tx) DescendLessOrEqual(index, pivot string, iterator Iterator) error {
+func (tx *Tx) DescendLessOrEqual(index, pivot string,
+	iterator func(key, value string) bool) error {
 	return tx.scan(true, false, true, index, pivot, "", iterator)
 }
 
@@ -1330,7 +1394,7 @@ func (tx *Tx) DescendLessOrEqual(index, pivot string, iterator Iterator) error {
 // When an index is not provided, the results will be ordered by the item key.
 // An invalid index will return an error.
 func (tx *Tx) DescendRange(index, lessOrEqual, greaterThan string,
-	iterator Iterator) error {
+	iterator func(key, value string) bool) error {
 	return tx.scan(
 		true, true, true, index, lessOrEqual, greaterThan, iterator,
 	)
@@ -1350,7 +1414,8 @@ func (r *rect) Rect(ctx interface{}) (min, max []float64) {
 // is represented by the rect string. This string will be processed by the
 // same bounds function that was passed to the CreateSpatialIndex() function.
 // An invalid index will return an error.
-func (tx *Tx) Intersects(index, bounds string, iterator Iterator) error {
+func (tx *Tx) Intersects(index, bounds string,
+	iterator func(key, value string) bool) error {
 	if tx.db == nil {
 		return ErrTxClosed
 	}
@@ -1469,20 +1534,37 @@ func IndexRect(a string) (min, max []float64) {
 // This is a case-insensitive comparison. Use the IndexBinary() for comparing
 // case-sensitive strings.
 func IndexString(a, b string) bool {
-	// This is a faster approach to strings.ToLower because it does not
-	// create new strings.
 	for i := 0; i < len(a) && i < len(b); i++ {
-		ca, cb := a[i], b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 32
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 32
-		}
-		if ca < cb {
-			return true
-		} else if ca > cb {
-			return false
+		if a[i] >= 'A' && a[i] <= 'Z' {
+			if b[i] >= 'A' && b[i] <= 'Z' {
+				// both are uppercase, do nothing
+				if a[i] < b[i] {
+					return true
+				} else if a[i] > b[i] {
+					return false
+				}
+			} else {
+				// a is uppercase, convert a to lowercase
+				if a[i]+32 < b[i] {
+					return true
+				} else if a[i]+32 > b[i] {
+					return false
+				}
+			}
+		} else if b[i] >= 'A' && b[i] <= 'Z' {
+			// b is uppercase, convert b to lowercase
+			if a[i] < b[i]+32 {
+				return true
+			} else if a[i] > b[i]+32 {
+				return false
+			}
+		} else {
+			// neither are uppercase
+			if a[i] < b[i] {
+				return true
+			} else if a[i] > b[i] {
+				return false
+			}
 		}
 	}
 	return len(a) < len(b)
@@ -1517,4 +1599,28 @@ func IndexFloat(a, b string) bool {
 	ia, _ := strconv.ParseFloat(a, 64)
 	ib, _ := strconv.ParseFloat(b, 64)
 	return ia < ib
+}
+
+// IndexJSON provides for the ability to create an index on any JSON field.
+// When the field is a string, the comparison will be case-insensitive.
+// It returns a helper function used by CreateIndex.
+func IndexJSON(path string) func(a, b string) bool {
+	return func(a, b string) bool {
+		return gjson.Get(a, path).Less(gjson.Get(b, path), false)
+	}
+}
+
+// IndexJSONCaseSensitive provides for the ability to create an index on
+// any JSON field.
+// When the field is a string, the comparison will be case-sensitive.
+// It returns a helper function used by CreateIndex.
+func IndexJSONCaseSensitive(path string) func(a, b string) bool {
+	return func(a, b string) bool {
+		return gjson.Get(a, path).Less(gjson.Get(b, path), true)
+	}
+}
+
+// Desc is a helper function that changes the order of an index.
+func Desc(less func(a, b string) bool) func(a, b string) bool {
+	return func(a, b string) bool { return less(b, a) }
 }

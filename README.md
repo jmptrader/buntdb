@@ -3,11 +3,10 @@
     src="logo.png" 
     width="307" height="150" border="0" alt="BuntDB">
 <br>
-<a href="https://travis-ci.org/tidwall/buntdb"><img src="https://travis-ci.org/tidwall/buntdb.svg?branch=master" alt="Build Status"></a>
-<img src="https://img.shields.io/badge/coverage-96%25-green.svg?style=flat" alt="Code Coverage">
-<a href="https://goreportcard.com/report/github.com/tidwall/buntdb"><img src="https://goreportcard.com/badge/github.com/tidwall/buntdb" alt="Go Report Card"></a>
-<a href="https://godoc.org/github.com/tidwall/buntdb"><img src="https://godoc.org/github.com/tidwall/buntdb?status.svg" alt="GoDoc"></a>
-<!--<img src="https://img.shields.io/badge/version-0.1.0-green.svg" alt="Version">-->
+<a href="https://travis-ci.org/tidwall/buntdb"><img src="https://img.shields.io/travis/tidwall/buntdb.svg?style=flat-square" alt="Build Status"></a>
+<a href="http://gocover.io/github.com/tidwall/buntdb"><img src="https://img.shields.io/badge/coverage-95%25-brightgreen.svg?style=flat-square" alt="Code Coverage"></a>
+<a href="https://goreportcard.com/report/github.com/tidwall/buntdb"><img src="https://goreportcard.com/badge/github.com/tidwall/buntdb?style=flat-square" alt="Go Report Card"></a>
+<a href="https://godoc.org/github.com/tidwall/buntdb"><img src="https://img.shields.io/badge/api-reference-blue.svg?style=flat-square" alt="GoDoc"></a>
 </p>
 
 ====
@@ -32,12 +31,14 @@ Features
 - In-memory database for [fast reads and writes](#performance)
 - Embeddable with a [simple API](https://godoc.org/github.com/tidwall/buntdb)
 - [Spatial indexing](#spatial-indexes) for up to 20 dimensions; Useful for Geospatial data
+- Index fields inside [JSON](#json-indexes) documents
 - Create [custom indexes](#custom-indexes) for any data type
+- Support for [multi value indexes](#multi-value-index); Similar to a SQL multi column index
 - [Built-in types](#built-in-types) that are easy to get up & running; String, Uint, Int, Float
 - Flexible [iteration](#iterating) of data; ascending, descending, and ranges
 - [Durable append-only file](#append-only-file) format for persistence. 
 - Option to evict old items with an [expiration](#data-expiration) TTL
-- Tight codebase, under 1K loc using the `cloc` command
+- Tight codebase, ~1K loc using the `cloc` command
 - ACID semantics with locking [transactions](#transactions) that support rollbacks
 
 Getting Started
@@ -48,7 +49,7 @@ Getting Started
 To start using BuntDB, install Go and run `go get`:
 
 ```sh
-$ go get github.com/tidwall/buntdb
+$ go get -u github.com/tidwall/buntdb
 ```
 
 This will retrieve the library.
@@ -119,7 +120,7 @@ To set a value you must open a read/write transaction:
 
 ```go
 err := db.Update(func(tx *buntdb.Tx) error {
-    err := tx.Set("mykey", "myvalue", nil)
+    _, _, err := tx.Set("mykey", "myvalue", nil)
     return err
 })
 ```
@@ -260,7 +261,7 @@ user:1:name 49
 user:4:name 63
 ```
 
-### Spatial Indexes
+## Spatial Indexes
 BuntDB has support for spatial indexes by storing rectangles in an [R-tree](https://en.wikipedia.org/wiki/R-tree). An R-tree is organized in a similar manner as a [B-tree](https://en.wikipedia.org/wiki/B-tree), and both are balanced trees. But, an R-tree is special because it can operate on data that is in multiple dimensions. This is super handy for Geospatial applications.
 
 To create a spatial index use the `CreateSpatialIndex` function:
@@ -296,9 +297,9 @@ db.View(func(tx *buntdb.Tx) error {
 
 This will get all three positions.
 
-#### Spatial bracket syntax
+### Spatial bracket syntax
 
-The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the built-in rectangles are processed, but you are not limited to this syntax. Whatever Rect function you choose to use during `CreateSpatialIndex` will be used to process the parameter, in this case it's `IndexRect`.
+The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the built-in rectangles are processed. But, you are not limited to this syntax. Whatever Rect function you choose to use during `CreateSpatialIndex` will be used to process the parameter, in this case it's `IndexRect`.
 
 - **2D rectangle:** `[10 15],[20 25]`  
 *Min XY: "10x15", Max XY: "20x25"*
@@ -306,7 +307,7 @@ The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the b
 - **3D rectangle:** `[10 15 12],[20 25 18]`  
 *Min XYZ: "10x15x12", Max XYZ: "20x25x18"*
 
-- **2D point:** `[10 15 12]`  
+- **2D point:** `[10 15]`  
 *XY: "10x15"*
 
 - **LatLon point:** `[-112.2693 33.5123]`  
@@ -317,7 +318,147 @@ The bracket syntax `[-117 30],[-112 36]` is unique to BuntDB, and it's how the b
 
 **Notice:** The longitude is the Y axis and is on the left, and latitude is the X axis and is on the right.
 
-### Data Expiration
+You can also represent `Infinity` by using `-inf` and `+inf`.  
+For example, you might have the following points (`[X Y M]` where XY is a point and M is a timestamp):
+```
+[3 9 1]
+[3 8 2]
+[4 8 3]
+[4 7 4]
+[5 7 5]
+[5 6 6]
+```
+
+You can then do a search for all points with `M` between 2-4 by calling `Intersects`.
+
+```go
+tx.Intersects("points", "[-inf -inf 2],[+inf +inf 4]", func(key, val string) bool {
+    println(val)
+    return true
+})
+```
+
+Which will return:
+
+```
+[3 8 2]
+[4 8 3]
+[4 7 4]
+```
+
+
+## JSON Indexes
+Indexes can be created on individual fields inside JSON documents. BuntDB uses [GJSON](https://github.com/tidwall/gjson) under the hood.
+
+For example:
+
+```go
+package main
+
+import (
+	"fmt"
+
+	"github.com/tidwall/buntdb"
+)
+
+func main() {
+	db, _ := buntdb.Open(":memory:")
+	db.CreateIndex("last_name", "*", buntdb.IndexJSON("name.last"))
+	db.CreateIndex("age", "*", buntdb.IndexJSON("age"))
+	db.Update(func(tx *buntdb.Tx) error {
+		tx.Set("1", `{"name":{"first":"Tom","last":"Johnson"},"age":38}`, nil)
+		tx.Set("2", `{"name":{"first":"Janet","last":"Prichard"},"age":47}`, nil)
+		tx.Set("3", `{"name":{"first":"Carol","last":"Anderson"},"age":52}`, nil)
+		tx.Set("4", `{"name":{"first":"Alan","last":"Cooper"},"age":28}`, nil)
+		return nil
+	})
+	db.View(func(tx *buntdb.Tx) error {
+		fmt.Println("Order by last name")
+		tx.Ascend("last_name", func(key, value string) bool {
+			fmt.Printf("%s: %s\n", key, value)
+			return true
+		})
+		fmt.Println("Order by age")
+		tx.Ascend("age", func(key, value string) bool {
+			fmt.Printf("%s: %s\n", key, value)
+			return true
+		})
+		fmt.Println("Order by age range 30-50")
+		tx.AscendRange("age", `{"age":30}`, `{"age":50}`, func(key, value string) bool {
+			fmt.Printf("%s: %s\n", key, value)
+			return true
+		})
+		return nil
+	})
+}
+```
+
+Results:
+
+```
+Order by last name
+3: {"name":{"first":"Carol","last":"Anderson"},"age":52}
+4: {"name":{"first":"Alan","last":"Cooper"},"age":28}
+1: {"name":{"first":"Tom","last":"Johnson"},"age":38}
+2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
+
+Order by age
+4: {"name":{"first":"Alan","last":"Cooper"},"age":28}
+1: {"name":{"first":"Tom","last":"Johnson"},"age":38}
+2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
+3: {"name":{"first":"Carol","last":"Anderson"},"age":52}
+
+Order by age range 30-50
+1: {"name":{"first":"Tom","last":"Johnson"},"age":38}
+2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
+```
+## Multi Value Index
+With BuntDB it's possible to join multiple values on a single index. 
+This is similar to a [multi column index](http://dev.mysql.com/doc/refman/5.7/en/multiple-column-indexes.html) in a traditional SQL database.
+
+In this example we are creating a multi value index on "name.last" and "age":
+
+```go
+db, _ := buntdb.Open(":memory:")
+db.CreateIndex("last_name_age", "*", buntdb.IndexJSON("name.last"), buntdb.IndexJSON("age"))
+db.Update(func(tx *buntdb.Tx) error {
+	tx.Set("1", `{"name":{"first":"Tom","last":"Johnson"},"age":38}`, nil)
+	tx.Set("2", `{"name":{"first":"Janet","last":"Prichard"},"age":47}`, nil)
+	tx.Set("3", `{"name":{"first":"Carol","last":"Anderson"},"age":52}`, nil)
+	tx.Set("4", `{"name":{"first":"Alan","last":"Cooper"},"age":28}`, nil)
+	tx.Set("5", `{"name":{"first":"Sam","last":"Anderson"},"age":51}`, nil)
+	tx.Set("6", `{"name":{"first":"Melinda","last":"Prichard"},"age":44}`, nil)
+	return nil
+})
+db.View(func(tx *buntdb.Tx) error {
+	tx.Ascend("last_name_age", func(key, value string) bool {
+		fmt.Printf("%s: %s\n", key, value)
+		return true
+	})
+	return nil
+})
+
+// Output:
+// 5: {"name":{"first":"Sam","last":"Anderson"},"age":51}
+// 3: {"name":{"first":"Carol","last":"Anderson"},"age":52}
+// 4: {"name":{"first":"Alan","last":"Cooper"},"age":28}
+// 1: {"name":{"first":"Tom","last":"Johnson"},"age":38}
+// 6: {"name":{"first":"Melinda","last":"Prichard"},"age":44}
+// 2: {"name":{"first":"Janet","last":"Prichard"},"age":47}
+```
+
+## Descending Ordered Index
+Any index can be put in descending order by wrapping it's less function with `buntdb.Desc`.
+
+```go
+db.CreateIndex("last_name_age", "*", 
+	buntdb.IndexJSON("name.last"), 
+	buntdb.Desc(buntdb.IndexJSON("age")))
+```
+
+This will create a multi value index where the last name is ascending and the age is descending.
+
+## Data Expiration
 Items can be automatically evicted by using the `SetOptions` object in the `Set` function to set a `TTL`.
 
 ```go
@@ -360,6 +501,28 @@ The `Config.SyncPolicy` has the following options:
 - `Never` - fsync is managed by the operating system, less safe
 - `EverySecond` - fsync every second, fast and safer, this is the default
 - `Always` - fsync after every write, very durable, slower
+
+## Config 
+
+Here are some configuration options that can be use to change various behaviors of the database.
+
+- **SyncPolicy** adjusts how often the data is synced to disk. This value can be Never, EverySecond, or Always. Default is EverySecond.
+- **AutoShrinkPercentage** is used by the background process to trigger a shrink of the aof file when the size of the file is larger than the percentage of the result of the previous shrunk file. For example, if this value is 100, and the last shrink process resulted in a 100mb file, then the new aof file must be 200mb before a shrink is triggered. Default is 100.
+- **AutoShrinkMinSize** defines the minimum size of the aof file before an automatic shrink can occur. Default is 32MB.
+- **AutoShrinkDisabled** turns off automatic background shrinking. Default is false.
+
+To update the configuration you should call `ReadConfig` followed by `SetConfig`. For example:
+
+```go
+
+var config buntdb.Config
+if err := db.ReadConfig(&config); err != nil{
+    log.Fatal(err)
+}
+if err := db.WriteConfig(config); err != nil{
+    log.Fatal(err)
+}
+```
 
 ## Performance
 
